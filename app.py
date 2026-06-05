@@ -15,6 +15,10 @@ AGENT_LOG = Path.home() / ".hermes/logs/agent.log"
 MAX_CTX = 40960
 CHARS_PER_TOKEN = 4  # rough estimate for JSONL sessions without token counts
 
+# nvidia-smi: WSL2 path, falls back to system PATH
+NVIDIA_SMI = Path("/usr/lib/wsl/lib/nvidia-smi")
+NVIDIA_SMI_CMD = str(NVIDIA_SMI) if NVIDIA_SMI.exists() else "nvidia-smi"
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -414,7 +418,7 @@ def get_gpu():
     # GPU stats via nvidia-smi
     try:
         smi = subprocess.run(
-            ["/usr/lib/wsl/lib/nvidia-smi",
+            [NVIDIA_SMI_CMD,
              "--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5
