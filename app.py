@@ -473,7 +473,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Hermes Dashboard</title>
+<title>Hermes Stats</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {
@@ -581,7 +581,7 @@ HTML = r"""<!DOCTYPE html>
 <body>
 <header>
   <div>
-    <h1>⚕ Hermes Dashboard</h1>
+    <h1>⚕ Hermes Stats</h1>
     <div class="subtitle" id="header-sub">laden...</div>
   </div>
   <button class="nav-btn" onclick="refresh()">↻ Vernieuwen</button>
