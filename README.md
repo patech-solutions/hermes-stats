@@ -64,7 +64,7 @@ Real-time tracking van Mistral API token gebruik en kosten:
 Vereist de Hermes virtual environment (`~/.hermes/hermes-agent/venv/`) — FastAPI en uvicorn zijn daarin al aanwezig.
 
 ```bash
-git clone http://ugreendxp2800.local:3000/Paikke/hermes-statistieken.git ~/.hermes/dashboard
+git clone https://github.com/patech-solutions/hermes-stats.git ~/.hermes/dashboard
 ```
 
 ### Systemd service (aanbevolen)
