@@ -16,7 +16,7 @@ AGENT_LOG = Path.home() / ".hermes/logs/agent.log"
 MAX_CTX = 64000  # Hermes default context window
 CHARS_PER_TOKEN = 4
 
-# Mistral API Pricing (as of June 2026, in EUR per 1K tokens)
+# API Pricing (as of June 2026, in EUR per 1K tokens)
 MISTRAL_PRICING = {
     'mistral-large-2512': {'input': 0.002, 'output': 0.006, 'cache': 0.001},
     'codestral-latest': {'input': 0.0005, 'output': 0.0015, 'cache': 0.00025},
@@ -152,7 +152,7 @@ def parse_memory_log() -> list:
 
 
 def parse_agent_log_tokens() -> list:
-    """Parse agent.log for Mistral API calls with token usage."""
+    """Parse agent.log for API calls with token usage."""
     if not AGENT_LOG.exists():
         return []
     
@@ -373,7 +373,10 @@ def enrich_session(row: dict, timings: list) -> dict:
     r["duration_s"] = round(ended - started, 1) if (ended and started and ended > started) else None
     r["started_str"] = datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M") if started else None
     base_url = r.get("billing_base_url") or ""
-    r["is_local"] = not base_url or "localhost" in base_url or "127.0.0.1" in base_url or r.get("billing_provider") == "custom"
+    billing_provider = r.get("billing_provider") or ""
+    # API usage (Mistral, Honcho, OpenRouter, etc.) is Cloud, not local
+    # Only mark as local if there's no API endpoint or it's a true local endpoint
+    r["is_local"] = not base_url or "localhost" in base_url or "127.0.0.1" in base_url
     r["context_pct"] = round((r.get("input_tokens") or 0) / MAX_CTX * 100, 1)
 
     # Compression: check for compressed messages (schema may have changed)
@@ -665,7 +668,7 @@ def get_memory_log(limit: int = 100):
 
 @app.get("/api/token-usage")
 def get_token_usage(days: int = 30):
-    """Get Mistral API token usage and costs from agent.log."""
+    """Get API token usage and costs from agent.log."""
     return get_token_usage_historical(days=days)
 
 
@@ -898,7 +901,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
     
     <div class="token-bar" id="token-bar">
-      <div class="token-title">Mistral API Token Gebruik &amp; Kosten</div>
+      <div class="token-title">API Kosten</div>
       <div id="token-content"><span style="color:var(--muted)">laden...</span></div>
     </div>
 
@@ -965,7 +968,7 @@ async function loadGPU() {
 
     if (gpu.error && gpu.error.includes("cloud-only")) {
       // Cloud-only mode - show clean message
-      html = '<span style="color:var(--muted)">Cloud-only modus: Hermes gebruikt Mistral API (geen lokale GPU)</span>';
+      html = '<span style="color:var(--muted)">Cloud-only modus: Hermes gebruikt API (geen lokale GPU)</span>';
     }
     else if (gpu.error) {
       html = `<span style="color:var(--muted)">${gpu.error}</span>`;
@@ -996,7 +999,7 @@ async function loadGPU() {
         </div>`).join('') + '</div>';
     } else if (!gpu.error || gpu.error.includes("cloud-only")) {
       // No models and cloud-only mode - show Mistral info
-      html += '<div class="models-row"><span style="color:var(--muted);font-size:12px">Gebruikt: Mistral API (codestral-latest, mistral-large-2512)</span></div>';
+      html += '<div class="models-row"><span style="color:var(--muted);font-size:12px">Gebruikt: API (codestral-latest, mistral-large-2512, etc.)</span></div>';
     } else {
       html += '<div class="models-row"><span style="color:var(--muted);font-size:12px">Geen modellen geladen</span></div>';
     }
@@ -1014,7 +1017,7 @@ async function loadTokenUsage() {
     let html = '';
     
     if (data.total_calls === 0) {
-      html = '<span style="color:var(--muted)">Geen Mistral API calls gevonden in agent.log</span>';
+      html = '<span style="color:var(--muted)">Geen API calls gevonden in agent.log</span>';
     } else {
       // Summary metrics
       const totalCost = data.total_cost || 0;
@@ -1053,8 +1056,9 @@ async function loadTokenUsage() {
 }
 
 function renderStats(stats) {
+  const cloud_count = stats.total - stats.local_count;
   document.getElementById('header-sub').textContent =
-    stats.total + ' sessies · ' + stats.local_count + '/' + stats.total + ' lokaal · Max ctx: ' + (stats.max_ctx||40960).toLocaleString('nl-NL') + ' tokens';
+    stats.total + ' sessies · ' + stats.local_count + ' lokaal / ' + cloud_count + ' API · Max ctx: ' + (stats.max_ctx||40960).toLocaleString('nl-NL') + ' tokens';
 
   const cards = [
     { label: 'Totaal sessies',      value: stats.total,                         sub: stats.completed + ' afgerond',                     cls: '' },
@@ -1065,7 +1069,7 @@ function renderStats(stats) {
     { label: 'Gem. reactietijd',    value: stats.avg_response_s ? stats.avg_response_s + 's' : '—', sub: 'max ' + (stats.max_response_s ? stats.max_response_s + 's' : '—'), cls: 'warn' },
     { label: 'Totaal tool calls',   value: fmtNum(stats.total_tool_calls),      sub: 'gem. ' + fmtNum(stats.avg_tools) + '/sessie',      cls: 'accent' },
     { label: 'Compressie',          value: stats.sessions_with_compression,     sub: 'sessies met compressie',                           cls: 'accent' },
-    { label: 'Lokale API',          value: stats.local_count + '/' + stats.total, sub: '100% lokaal',                                   cls: 'green' },
+    { label: 'API Type',            value: stats.local_count + ' lokaal / ' + (stats.total - stats.local_count) + ' API', sub: 'Backend verdeling',                                   cls: 'green' },
   ];
 
   document.getElementById('stats-grid').innerHTML = cards.map(c => `
