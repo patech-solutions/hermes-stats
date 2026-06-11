@@ -1,6 +1,6 @@
 # Hermes Stats — Token Gebruik & Systeem Dashboard
 
-Statistieken dashboard voor [Hermes](https://github.com/NousResearch/hermes-agent) sessies, **Mistral API token gebruik** en systeemgebruik. Gebouwd met FastAPI en Chart.js.
+Statistieken dashboard voor [Hermes](https://github.com/NousResearch/hermes-agent) sessies, **API token gebruik** en systeemgebruik. Gebouwd met FastAPI en Chart.js.
 
 ## 📋 Recente Fixes (2026-06-11)
 
@@ -12,14 +12,14 @@ Statistieken dashboard voor [Hermes](https://github.com/NousResearch/hermes-agen
 ### GPU Endpoint Verbeteringen
 - **Gefixt**: Beter error handling voor cloud-only modus (geen nvidia-smi foutmeldingen)
 - **Gefixt**: Automatische detectie van cloud-only vs lokale GPU
-- **Aangepast**: Duidelijke melding "Cloud-only modus: Hermes gebruikt Mistral API" in dashboard
+- **Aangepast**: Duidelijke melding "Cloud-only modus: Hermes gebruikt API" in dashboard
 
 ### API Endpoints
 Alle endpoints werken nu correct:
 - `/api/sessions` — Sessies lijst
 - `/api/stats` — Statistieken overzicht  
 - `/api/gpu` — GPU status (cloud-only of lokaal)
-- `/api/token-usage` — Mistral API token gebruik & kosten
+- `/api/token-usage` — API token gebruik & kosten
 - `/api/models` — Per-model statistieken
 - `/api/token-usage/daily` — Dagelijkse token usage
 - `/api/token-usage/sessions` — Token usage per sessie
@@ -28,7 +28,7 @@ Alle endpoints werken nu correct:
 
 ### 🎯 Overzichtsscherm
 - **GPU status** met temperatuur, gebruik, VRAM-verbruik en geladen Ollama modellen (live, elke 10 seconden)
-- **Mistral API Token Gebruik** — real-time kosten tracking per model (refresh elke 30 seconden)
+- **API Token Gebruik** — real-time kosten tracking per model (refresh elke 30 seconden)
   - Totaal kosten (€)
   - API calls per model
   - Tokens per model
@@ -47,7 +47,7 @@ Alle endpoints werken nu correct:
 - Compressiestatus
 
 ### 💰 Mistral Token Tracking (NIEUW!)
-Real-time tracking van Mistral API token gebruik en kosten:
+Real-time tracking van API token gebruik en kosten:
 
 **API Endpoints:**
 - `/api/token-usage` — Totale token usage en kosten (per model)
@@ -57,7 +57,7 @@ Real-time tracking van Mistral API token gebruik en kosten:
 
 **Bronnen:**
 - `agent.log` — API calls met input/output/cache tokens
-- Prijzen gebaseerd op Mistral API pricing (juni 2026)
+- Prijzen gebaseerd op API pricing (juni 2026)
 
 **Ondersteunde Modellen:**
 | Model | Input (€/1K) | Output (€/1K) | Cache (€/1K) |

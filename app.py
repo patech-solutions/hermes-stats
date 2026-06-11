@@ -1058,7 +1058,7 @@ async function loadTokenUsage() {
 function renderStats(stats) {
   const cloud_count = stats.total - stats.local_count;
   document.getElementById('header-sub').textContent =
-    stats.total + ' sessies · ' + stats.local_count + ' lokaal / ' + cloud_count + ' API · Max ctx: ' + (stats.max_ctx||40960).toLocaleString('nl-NL') + ' tokens';
+    stats.total + ' sessies · ' + stats.total + ' Cloud API · Max ctx: ' + (stats.max_ctx||40960).toLocaleString('nl-NL') + ' tokens';
 
   const cards = [
     { label: 'Totaal sessies',      value: stats.total,                         sub: stats.completed + ' afgerond',                     cls: '' },
@@ -1069,7 +1069,7 @@ function renderStats(stats) {
     { label: 'Gem. reactietijd',    value: stats.avg_response_s ? stats.avg_response_s + 's' : '—', sub: 'max ' + (stats.max_response_s ? stats.max_response_s + 's' : '—'), cls: 'warn' },
     { label: 'Totaal tool calls',   value: fmtNum(stats.total_tool_calls),      sub: 'gem. ' + fmtNum(stats.avg_tools) + '/sessie',      cls: 'accent' },
     { label: 'Compressie',          value: stats.sessions_with_compression,     sub: 'sessies met compressie',                           cls: 'accent' },
-    { label: 'API Type',            value: stats.local_count + ' lokaal / ' + (stats.total - stats.local_count) + ' API', sub: 'Backend verdeling',                                   cls: 'green' },
+    { label: 'API Type',            value: stats.total + ' Cloud API', sub: 'Backend verdeling',                                   cls: 'green' },
   ];
 
   document.getElementById('stats-grid').innerHTML = cards.map(c => `
@@ -1221,7 +1221,7 @@ function renderSessions(sessions) {
     </div>`;
     const tools = (s.tools_used||[]).slice(0,3).map(t=>`<span class="pill pill-tool">${t.replace(/_tool$/,'')}</span>`).join('') +
       ((s.tools_used||[]).length > 3 ? `<span class="pill pill-tool">+${s.tools_used.length-3}</span>` : '');
-    const backend = s.is_local ? '<span class="pill pill-local">lokaal</span>' : '<span class="pill pill-cloud">cloud</span>';
+    const backend = '<span class="pill pill-cloud">Cloud API</span>';
     const comp = s.compression_used ? '<span class="pill pill-compressed">ja</span>' : '<span style="color:var(--muted)">—</span>';
     const turns = s.api_call_count || 0;
     const turnsEst = s.token_source === 'estimated' ? '<span class="pill-est">~</span>' : '';
@@ -1253,7 +1253,7 @@ async function showDetail(id) {
     const s = await fetchJSON(`/api/sessions/${id}`);
     const turns = s.turns || [];
     const cp = s.context_pct || 0;
-    const backend = s.is_local ? '<span class="pill pill-local">lokaal</span>' : '<span class="pill pill-cloud">cloud</span>';
+    const backend = '<span class="pill pill-cloud">Cloud API</span>';
     const comp = s.compression_used ? `<span class="pill pill-compressed">${s.compressed_count} berichten gecomprimeerd</span>` : '—';
     const estNote = s.token_source === 'estimated' ? ' <span class="pill-est">geschat</span>' : '';
 
