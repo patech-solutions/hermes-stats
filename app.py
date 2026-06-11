@@ -584,49 +584,69 @@ def get_stats():
 @app.get("/api/gpu")
 def get_gpu():
     result = {"error": None, "models": []}
+    
+    # Check if this is a cloud/API-only setup (no local GPU)
+    # In this case, we return a clean message instead of errors
+    is_cloud_only = True
+    
     # GPU stats via nvidia-smi
     try:
-        smi = subprocess.run(
-            [NVIDIA_SMI_CMD,
-             "--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5
-        )
-        if smi.returncode == 0:
-            parts = [p.strip() for p in smi.stdout.strip().split(",")]
-            result.update({
-                "name": parts[0],
-                "temp_c": parts[1],
-                "util_pct": parts[2],
-                "vram_used_mb": int(parts[3]),
-                "vram_total_mb": int(parts[4]),
-                "power_w": parts[5],
-                "vram_pct": round(int(parts[3]) / int(parts[4]) * 100, 1),
-            })
+        if not Path("/usr/lib/wsl/lib/nvidia-smi").exists():
+            # Try to find nvidia-smi in PATH
+            import shutil
+            if shutil.which("nvidia-smi") is None:
+                is_cloud_only = True
+                result["error"] = "Geen lokale GPU beschikbaar (cloud-only modus)"
+            else:
+                is_cloud_only = False
         else:
-            result["error"] = smi.stderr.strip()
+            is_cloud_only = False
+        
+        if not is_cloud_only:
+            smi = subprocess.run(
+                [NVIDIA_SMI_CMD,
+                 "--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5
+            )
+            if smi.returncode == 0:
+                parts = [p.strip() for p in smi.stdout.strip().split(",")]
+                result.update({
+                    "name": parts[0],
+                    "temp_c": parts[1],
+                    "util_pct": parts[2],
+                    "vram_used_mb": int(parts[3]),
+                    "vram_total_mb": int(parts[4]),
+                    "power_w": parts[5],
+                    "vram_pct": round(int(parts[3]) / int(parts[4]) * 100, 1),
+                })
+            else:
+                result["error"] = smi.stderr.strip() or "nvidia-smi fout"
     except Exception as e:
-        result["error"] = str(e)
+        result["error"] = "Geen lokale GPU beschikbaar"
 
     # Loaded models via ollama ps
     try:
-        ps = subprocess.run(
-            ["ollama", "ps"],
-            capture_output=True, text=True, timeout=5
-        )
-        if ps.returncode == 0:
-            lines = ps.stdout.strip().splitlines()
-            for line in lines[1:]:  # skip header
-                parts = line.split()
-                if len(parts) >= 5:
-                    result["models"].append({
-                        "name": parts[0],
-                        "size": parts[2] + " " + parts[3],
-                        "processor": parts[4],
-                        "context": parts[5] if len(parts) > 5 else "—",
-                    })
-    except Exception as e:
-        result["models_error"] = str(e)
+        import shutil
+        if shutil.which("ollama") is not None:
+            ps = subprocess.run(
+                ["ollama", "ps"],
+                capture_output=True, text=True, timeout=5
+            )
+            if ps.returncode == 0:
+                lines = ps.stdout.strip().splitlines()
+                for line in lines[1:]:  # skip header
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        result["models"].append({
+                            "name": parts[0],
+                            "size": parts[2] + " " + parts[3],
+                            "processor": parts[4],
+                            "context": parts[5] if len(parts) > 5 else "—",
+                        })
+    except Exception:
+        # Ollama not available - this is expected in cloud-only mode
+        pass
 
     return result
 
@@ -930,12 +950,20 @@ async function fetchJSON(url) {
   return r.json();
 }
 
+
 async function loadGPU() {
   try {
     const gpu = await fetchJSON('/api/gpu');
     let html = '';
 
-    if (!gpu.error) {
+    if (gpu.error && gpu.error.includes("cloud-only")) {
+      // Cloud-only mode - show clean message
+      html = '<span style="color:var(--muted)">Cloud-only modus: Hermes gebruikt Mistral API (geen lokale GPU)</span>';
+    }
+    else if (gpu.error) {
+      html = `<span style="color:var(--muted)">${gpu.error}</span>`;
+    }
+    else {
       const vp = gpu.vram_pct;
       const vc = vp > 90 ? 'fill-danger' : vp > 70 ? 'fill-warn' : 'fill-green';
       html += `<div class="gpu-row">
@@ -951,8 +979,6 @@ async function loadGPU() {
           <div class="progress"><div class="progress-fill ${vc}" style="width:${Math.min(vp,100)}%"></div></div>
         </div>
       </div>`;
-    } else {
-      html += `<span style="color:var(--muted)">${gpu.error}</span>`;
     }
 
     if (gpu.models && gpu.models.length > 0) {
@@ -961,6 +987,9 @@ async function loadGPU() {
           <span class="mn">${m.name}</span>
           <span class="ms">${m.size} · ${m.processor} · ctx ${m.context}</span>
         </div>`).join('') + '</div>';
+    } else if (!gpu.error || gpu.error.includes("cloud-only")) {
+      // No models and cloud-only mode - show Mistral info
+      html += '<div class="models-row"><span style="color:var(--muted);font-size:12px">Gebruikt: Mistral API (codestral-latest, mistral-large-2512)</span></div>';
     } else {
       html += '<div class="models-row"><span style="color:var(--muted);font-size:12px">Geen modellen geladen</span></div>';
     }
