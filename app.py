@@ -1,8 +1,9 @@
 import json
 import re
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from collections import defaultdict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -12,8 +13,17 @@ app = FastAPI(title="Hermes Dashboard")
 DB_PATH = Path.home() / ".hermes/state.db"
 SESSIONS_DIR = Path.home() / ".hermes/sessions"
 AGENT_LOG = Path.home() / ".hermes/logs/agent.log"
-MAX_CTX = 40960
-CHARS_PER_TOKEN = 4  # rough estimate for JSONL sessions without token counts
+MAX_CTX = 64000  # Hermes default context window
+CHARS_PER_TOKEN = 4
+
+# Mistral API Pricing (as of June 2026, in EUR per 1K tokens)
+MISTRAL_PRICING = {
+    'mistral-large-2512': {'input': 0.002, 'output': 0.006, 'cache': 0.001},
+    'codestral-latest': {'input': 0.0005, 'output': 0.0015, 'cache': 0.00025},
+    'mistral-small-2603': {'input': 0.00025, 'output': 0.00075, 'cache': 0.000125},
+    'mistral-tiny-latest': {'input': 0.00008, 'output': 0.00024, 'cache': 0.00004},
+    'mistral-medium-3-5': {'input': 0.0007, 'output': 0.0021, 'cache': 0.00035},
+}
 
 # nvidia-smi: WSL2 path, falls back to system PATH
 NVIDIA_SMI = Path("/usr/lib/wsl/lib/nvidia-smi")
@@ -139,6 +149,165 @@ def parse_memory_log() -> list:
             ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
             result.append({"ts": ts, "ts_str": m.group(1), "rss_mb": int(m.group(2))})
     return result
+
+
+def parse_agent_log_tokens() -> list:
+    """Parse agent.log for Mistral API calls with token usage."""
+    if not AGENT_LOG.exists():
+        return []
+    
+    # Pattern to match API call lines with token counts
+    pattern = re.compile(
+        r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?'
+        r'\[([^\]]+)\] agent\.conversation_loop: API call #(\d+): '
+        r'model=(\S+).*?'
+        r'in=(\d+) out=(\d+) total=(\d+)'
+    )
+    
+    # Pattern for cache hits
+    cache_pattern = re.compile(r'cache=(\d+)/(\d+)')
+    
+    results = []
+    for line in AGENT_LOG.read_text(errors="replace").splitlines():
+        api_match = pattern.search(line)
+        if api_match:
+            timestamp_str = api_match.group(1)
+            session_id = api_match.group(2)
+            call_num = api_match.group(3)
+            model = api_match.group(4)
+            in_tokens = int(api_match.group(5))
+            out_tokens = int(api_match.group(6))
+            total_tokens = int(api_match.group(7))
+            
+            # Check for cache in same line
+            cache_match = cache_pattern.search(line)
+            cache_in = 0
+            cache_out = 0
+            if cache_match:
+                cache_in = int(cache_match.group(1))
+                cache_out = int(cache_match.group(2))
+            
+            try:
+                ts = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S").timestamp()
+            except Exception:
+                ts = None
+            
+            # Calculate cost for this call
+            cost = calculate_call_cost(model, in_tokens, out_tokens, cache_in)
+            
+            results.append({
+                'timestamp': timestamp_str,
+                'ts': ts,
+                'session_id': session_id,
+                'call_num': call_num,
+                'model': model,
+                'in_tokens': in_tokens,
+                'out_tokens': out_tokens,
+                'total_tokens': total_tokens,
+                'cache_in': cache_in,
+                'cache_out': cache_out,
+                'cost_eur': cost
+            })
+    
+    return results
+
+
+def calculate_call_cost(model: str, in_tokens: int, out_tokens: int, cache_tokens: int = 0) -> float:
+    """Calculate cost for a single API call based on model pricing."""
+    pricing = MISTRAL_PRICING.get(model)
+    if not pricing:
+        # Default to codestral-latest pricing if model not found
+        pricing = MISTRAL_PRICING.get('codestral-latest', {'input': 0.0005, 'output': 0.0015, 'cache': 0.00025})
+    
+    cost = 0.0
+    cost += (in_tokens / 1000) * pricing.get('input', 0)
+    cost += (out_tokens / 1000) * pricing.get('output', 0)
+    cost += (cache_tokens / 1000) * pricing.get('cache', 0)
+    return round(cost, 6)
+
+
+def get_token_usage_historical(days: int = 30) -> dict:
+    """Get historical token usage and costs from agent.log."""
+    token_calls = parse_agent_log_tokens()
+    
+    if not token_calls:
+        return {
+            'total_calls': 0,
+            'models': {},
+            'daily': [],
+            'total_cost': 0.0
+        }
+    
+    # Group by model
+    models = defaultdict(lambda: {
+        'calls': 0,
+        'in_tokens': 0,
+        'out_tokens': 0,
+        'cache_tokens': 0,
+        'cost': 0.0
+    })
+    
+    # Group by day
+    daily = defaultdict(lambda: {
+        'calls': 0,
+        'in_tokens': 0,
+        'out_tokens': 0,
+        'cost': 0.0,
+        'models': {}
+    })
+    
+    for call in token_calls:
+        model = call['model']
+        day = call['timestamp'].split()[0]  # YYYY-MM-DD
+        
+        # Update model stats
+        models[model]['calls'] += 1
+        models[model]['in_tokens'] += call['in_tokens']
+        models[model]['out_tokens'] += call['out_tokens']
+        models[model]['cache_tokens'] += call['cache_in']
+        models[model]['cost'] += call['cost_eur']
+        
+        # Update daily stats
+        if day not in daily:
+            daily[day] = {
+                'calls': 0,
+                'in_tokens': 0,
+                'out_tokens': 0,
+                'cost': 0.0,
+                'models': {}
+            }
+        daily[day]['calls'] += 1
+        daily[day]['in_tokens'] += call['in_tokens']
+        daily[day]['out_tokens'] += call['out_tokens']
+        daily[day]['cost'] += call['cost_eur']
+        daily[day]['models'][model] = daily[day]['models'].get(model, 0) + call['cost_eur']
+    
+    # Sort and format
+    sorted_models = dict(sorted(models.items(), key=lambda x: x[1]['cost'], reverse=True))
+    for model in sorted_models:
+        sorted_models[model]['cost'] = round(sorted_models[model]['cost'], 4)
+    
+    sorted_daily = []
+    cutoff_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    for day in sorted(daily.keys(), reverse=True):
+        if day >= cutoff_date:
+            sorted_daily.append({
+                'date': day,
+                'calls': daily[day]['calls'],
+                'in_tokens': daily[day]['in_tokens'],
+                'out_tokens': daily[day]['out_tokens'],
+                'cost': round(daily[day]['cost'], 4)
+            })
+    
+    total_cost = round(sum(m['cost'] for m in models.values()), 4)
+    
+    return {
+        'total_calls': len(token_calls),
+        'models': sorted_models,
+        'daily': sorted_daily,
+        'total_cost': total_cost,
+        'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
 
 
 def db_messages_metrics(session_id: str) -> dict:
@@ -467,6 +636,93 @@ def get_memory_log(limit: int = 100):
     return parse_memory_log()[-limit:]
 
 
+@app.get("/api/token-usage")
+def get_token_usage(days: int = 30):
+    """Get Mistral API token usage and costs from agent.log."""
+    return get_token_usage_historical(days=days)
+
+
+@app.get("/api/models")
+def get_models_stats(days: int = 30):
+    """Get per-model statistics from agent.log."""
+    data = get_token_usage_historical(days=days)
+    return data['models']
+
+
+@app.get("/api/token-usage/daily")
+def get_daily_token_usage(days: int = 30):
+    """Get daily token usage from agent.log."""
+    data = get_token_usage_historical(days=days)
+    return data['daily']
+
+
+@app.get("/api/token-usage/sessions")
+def get_token_usage_by_session():
+    """Get token usage aggregated by session from agent.log."""
+    token_calls = parse_agent_log_tokens()
+    
+    # Group by session
+    sessions = defaultdict(lambda: {
+        'calls': 0,
+        'in_tokens': 0,
+        'out_tokens': 0,
+        'cache_tokens': 0,
+        'cost': 0.0,
+        'models': defaultdict(lambda: {'calls': 0, 'in_tokens': 0, 'out_tokens': 0, 'cost': 0.0}),
+        'start_ts': None,
+        'end_ts': None
+    })
+    
+    for call in token_calls:
+        sid = call['session_id']
+        sessions[sid]['calls'] += 1
+        sessions[sid]['in_tokens'] += call['in_tokens']
+        sessions[sid]['out_tokens'] += call['out_tokens']
+        sessions[sid]['cache_tokens'] += call['cache_in']
+        sessions[sid]['cost'] += call['cost_eur']
+        
+        model = call['model']
+        sessions[sid]['models'][model]['calls'] += 1
+        sessions[sid]['models'][model]['in_tokens'] += call['in_tokens']
+        sessions[sid]['models'][model]['out_tokens'] += call['out_tokens']
+        sessions[sid]['models'][model]['cost'] += call['cost_eur']
+        
+        # Update timestamps
+        if sessions[sid]['start_ts'] is None or (call['ts'] and call['ts'] < sessions[sid]['start_ts']):
+            sessions[sid]['start_ts'] = call['ts']
+        if sessions[sid]['end_ts'] is None or (call['ts'] and call['ts'] > sessions[sid]['end_ts']):
+            sessions[sid]['end_ts'] = call['ts']
+    
+    # Format and sort
+    result = []
+    for sid, data in sessions.items():
+        # Convert defaultdict to regular dict
+        models_dict = {k: dict(v) for k, v in data['models'].items()}
+        for model in models_dict:
+            models_dict[model]['cost'] = round(models_dict[model]['cost'], 6)
+        
+        # Convert timestamps
+        start_str = datetime.fromtimestamp(data['start_ts']).strftime('%Y-%m-%d %H:%M:%S') if data['start_ts'] else None
+        end_str = datetime.fromtimestamp(data['end_ts']).strftime('%Y-%m-%d %H:%M:%S') if data['end_ts'] else None
+        
+        result.append({
+            'session_id': sid,
+            'calls': data['calls'],
+            'in_tokens': data['in_tokens'],
+            'out_tokens': data['out_tokens'],
+            'cache_tokens': data['cache_tokens'],
+            'cost_eur': round(data['cost'], 6),
+            'models': models_dict,
+            'start': start_str,
+            'end': end_str
+        })
+    
+    # Sort by cost descending, then by start time
+    result.sort(key=lambda x: (-x['cost_eur'], x.get('start', '') or ''))
+    
+    return result
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     return HTMLResponse(content=HTML)
@@ -498,6 +754,19 @@ HTML = r"""<!DOCTYPE html>
 
   main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
 
+  /* Token Usage Bar */
+  .token-bar { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 18px; margin-bottom: 16px; }
+  .token-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing:.5px; margin-bottom: 10px; }
+  .token-row { display: flex; gap: 28px; flex-wrap: wrap; align-items: center; }
+  .token-metric .tl { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+  .token-metric .tv { font-size: 16px; font-weight: 600; }
+  .progress-wrap { flex: 1; min-width: 180px; }
+  .progress-label { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .progress { background: var(--card2); border-radius: 4px; height: 8px; overflow: hidden; }
+  .progress-fill { height: 100%; border-radius: 4px; transition: width .3s; }
+  .fill-green { background: var(--accent2); } .fill-warn { background: var(--warn); } .fill-danger { background: var(--danger); } .fill-accent { background: var(--accent); }
+  
   /* GPU Bar */
   .gpu-bar { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
     padding: 14px 18px; margin-bottom: 16px; }
@@ -505,11 +774,14 @@ HTML = r"""<!DOCTYPE html>
   .gpu-row { display: flex; gap: 28px; flex-wrap: wrap; align-items: center; }
   .gpu-metric .gl { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
   .gpu-metric .gv { font-size: 16px; font-weight: 600; }
-  .progress-wrap { flex: 1; min-width: 180px; }
-  .progress-label { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
-  .progress { background: var(--card2); border-radius: 4px; height: 8px; overflow: hidden; }
-  .progress-fill { height: 100%; border-radius: 4px; transition: width .3s; }
-  .fill-green { background: var(--accent2); } .fill-warn { background: var(--warn); } .fill-danger { background: var(--danger); } .fill-accent { background: var(--accent); }
+  
+  /* Token Bar */
+  .token-bar { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 18px; margin-bottom: 16px; }
+  .token-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing:.5px; margin-bottom: 10px; }
+  .token-row { display: flex; gap: 28px; flex-wrap: wrap; align-items: center; }
+  .token-metric .tl { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+  .token-metric .tv { font-size: 16px; font-weight: 600; }
 
   /* Models section */
   .models-row { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border);
@@ -597,12 +869,22 @@ HTML = r"""<!DOCTYPE html>
       <div class="gpu-title">GPU &amp; Geladen modellen</div>
       <div id="gpu-content"><span style="color:var(--muted)">laden...</span></div>
     </div>
+    
+    <div class="token-bar" id="token-bar">
+      <div class="token-title">Mistral API Token Gebruik &amp; Kosten</div>
+      <div id="token-content"><span style="color:var(--muted)">laden...</span></div>
+    </div>
 
     <div class="stats-grid" id="stats-grid"><div class="loading">laden...</div></div>
 
     <div class="charts-row">
       <div class="chart-card"><h3>Sessies per dag (30 dagen)</h3><canvas id="chart-sessions"></canvas></div>
       <div class="chart-card"><h3>Top tools gebruikt</h3><canvas id="chart-tools"></canvas></div>
+    </div>
+    
+    <div class="charts-row">
+      <div class="chart-card"><h3>Token kosten per model (30 dagen)</h3><canvas id="chart-models"></canvas></div>
+      <div class="chart-card"><h3>Dagelijkse token kosten</h3><canvas id="chart-daily-costs"></canvas></div>
     </div>
 
     <div class="section-header">
@@ -631,9 +913,10 @@ HTML = r"""<!DOCTYPE html>
 </main>
 
 <script>
-let chartSessions, chartTools;
+let chartSessions, chartTools, chartModels, chartDailyCosts;
 
 const fmtNum = n => n == null ? '—' : Math.round(n).toLocaleString('nl-NL');
+const fmtMoney = n => n == null ? '€0.0000' : '€' + n.toFixed(4);
 const fmtDur = s => {
   if (!s || s <= 0) return '—';
   if (s < 60) return s.toFixed(1) + 's';
@@ -688,6 +971,51 @@ async function loadGPU() {
   }
 }
 
+
+async function loadTokenUsage() {
+  try {
+    const data = await fetchJSON('/api/token-usage?days=30');
+    let html = '';
+    
+    if (data.total_calls === 0) {
+      html = '<span style="color:var(--muted)">Geen Mistral API calls gevonden in agent.log</span>';
+    } else {
+      // Summary metrics
+      const totalCost = data.total_cost || 0;
+      const totalCalls = data.total_calls || 0;
+      const totalTokens = Object.values(data.models || {}).reduce((sum, m) => sum + m.in_tokens + m.out_tokens, 0);
+      
+      html += `<div class="token-row">
+        <div class="token-metric"><div class="tl">Totaal kosten</div><div class="tv">€${totalCost.toFixed(4)}</div></div>
+        <div class="token-metric"><div class="tl">API calls</div><div class="tv">${totalCalls.toLocaleString('nl-NL')}</div></div>
+        <div class="token-metric"><div class="tl">Totale tokens</div><div class="tv">${(totalTokens/1000).toFixed(0)}K</div></div>
+        <div class="token-metric"><div class="tl">Laatste update</div><div class="tv" style="font-size:12px;color:var(--muted)">${data.last_updated || '—'}</div></div>
+      </div>`;
+      
+      // Model breakdown
+      if (data.models && Object.keys(data.models).length > 0) {
+        html += '<div class="models-row" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">';
+        for (const [model, stats] of Object.entries(data.models)) {
+          const costPct = (stats.cost / totalCost * 100).toFixed(1);
+          html += `
+          <div class="model-chip">
+            <span class="mn">${model}</span>
+            <span class="ms">€${stats.cost.toFixed(4)} · ${stats.calls} calls · ${(stats.in_tokens/1000).toFixed(0)}K/${(stats.out_tokens/1000).toFixed(0)}K tokens</span>
+            <div class="progress" style="margin-top:4px;height:4px">
+              <div class="progress-fill fill-accent" style="width:${Math.min(costPct, 100)}%"></div>
+            </div>
+          </div>`;
+        }
+        html += '</div>';
+      }
+    }
+    
+    document.getElementById('token-content').innerHTML = html;
+  } catch(e) {
+    document.getElementById('token-content').innerHTML = `<span style="color:var(--muted)">Token usage niet beschikbaar: ${e.message}</span>`;
+  }
+}
+
 function renderStats(stats) {
   document.getElementById('header-sub').textContent =
     stats.total + ' sessies · ' + stats.local_count + '/' + stats.total + ' lokaal · Max ctx: ' + (stats.max_ctx||40960).toLocaleString('nl-NL') + ' tokens';
@@ -734,6 +1062,109 @@ function renderStats(stats) {
       scales: { x: { ticks: { color: '#8892b0' }, grid: { color: '#2e3250' }, beginAtZero: true },
                 y: { ticks: { color: '#8892b0', font: { size: 11 } }, grid: { color: '#2e3250' } } } }
   });
+}
+
+
+async function renderTokenCharts() {
+  try {
+    const [tokenData, dailyData] = await Promise.all([
+      fetchJSON('/api/token-usage?days=30'),
+      fetchJSON('/api/token-usage/daily?days=30')
+    ]);
+    
+    // Model costs chart
+    if (tokenData.models && Object.keys(tokenData.models).length > 0) {
+      const models = Object.entries(tokenData.models)
+        .sort((a, b) => b[1].cost - a[1].cost);
+      
+      const ctxM = document.getElementById('chart-models').getContext('2d');
+      if (chartModels) chartModels.destroy();
+      chartModels = new Chart(ctxM, {
+        type: 'bar',
+        data: {
+          labels: models.map(m => m[0]),
+          datasets: [{
+            label: 'Kosten (€)',
+            data: models.map(m => m[1].cost),
+            backgroundColor: 'rgba(124,106,247,0.6)',
+            borderRadius: 4
+          }]
+        },
+        options: {
+          indexAxis: 'y',
+          plugins: { 
+            legend: { display: false },
+            tooltip: { 
+              callbacks: { 
+                label: (ctx) => fmtMoney(ctx.parsed.y)
+              }
+            }
+          },
+          scales: {
+            x: { 
+              ticks: { color: '#8892b0' }, 
+              grid: { color: '#2e3250' }, 
+              beginAtZero: true
+            },
+            y: { 
+              ticks: { 
+                color: '#8892b0', 
+                font: { size: 11 },
+                callback: (v) => fmtMoney(v)
+              }, 
+              grid: { color: '#2e3250' }
+            }
+          }
+        }
+      });
+    }
+    
+    // Daily costs chart
+    if (dailyData && dailyData.length > 0) {
+      const ctxD = document.getElementById('chart-daily-costs').getContext('2d');
+      if (chartDailyCosts) chartDailyCosts.destroy();
+      chartDailyCosts = new Chart(ctxD, {
+        type: 'line',
+        data: {
+          labels: dailyData.map(d => d.date.slice(5)),
+          datasets: [{
+            label: 'Kosten (€)',
+            data: dailyData.map(d => d.cost),
+            borderColor: 'rgba(86,217,160,0.8)',
+            backgroundColor: 'rgba(86,217,160,0.2)',
+            fill: true,
+            tension: 0.4
+          }]
+        },
+        options: {
+          plugins: { 
+            legend: { display: false },
+            tooltip: { 
+              callbacks: { 
+                label: (ctx) => fmtMoney(ctx.parsed.y)
+              }
+            }
+          },
+          scales: {
+            x: { 
+              ticks: { color: '#8892b0' }, 
+              grid: { color: '#2e3250' }
+            },
+            y: { 
+              ticks: { 
+                color: '#8892b0', 
+                beginAtZero: true,
+                callback: (v) => fmtMoney(v)
+              }, 
+              grid: { color: '#2e3250' }
+            }
+          }
+        }
+      });
+    }
+  } catch(e) {
+    console.error('Error rendering token charts:', e);
+  }
 }
 
 function renderSessions(sessions) {
@@ -860,13 +1291,19 @@ async function refresh() {
     const [stats, sessions] = await Promise.all([fetchJSON('/api/stats'), fetchJSON('/api/sessions')]);
     renderStats(stats);
     renderSessions(sessions);
+    await renderTokenCharts();
   } catch(e) {
     document.getElementById('stats-grid').innerHTML = `<div class="error-msg">Fout: ${e.message}</div>`;
   }
 }
 
+// Load initial data
 loadGPU();
+loadTokenUsage();
+
+// Set up periodic refresh
 setInterval(loadGPU, 10000);
+setInterval(loadTokenUsage, 30000);  // Refresh token usage every 30 seconds (near real-time)
 refresh();
 </script>
 </body>
