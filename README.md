@@ -2,6 +2,28 @@
 
 Statistieken dashboard voor [Hermes](https://github.com/NousResearch/hermes-agent) sessies, **Mistral API token gebruik** en systeemgebruik. Gebouwd met FastAPI en Chart.js.
 
+## 📋 Recente Fixes (2026-06-11)
+
+### Database Schema Compatibiliteit
+- **Gefixt**: `archived` kolom verwijderd uit alle queries (bestaat niet in huidige Hermes `state.db`)
+- **Gefixt**: `active` kolom vervangen door algemene queries (bestaat niet in huidige Hermes `messages` tabel)
+- **Aangepast**: Compressie tracking werkt nu met huidige schema (telt alle sessies met berichten)
+
+### GPU Endpoint Verbeteringen
+- **Gefixt**: Beter error handling voor cloud-only modus (geen nvidia-smi foutmeldingen)
+- **Gefixt**: Automatische detectie van cloud-only vs lokale GPU
+- **Aangepast**: Duidelijke melding "Cloud-only modus: Hermes gebruikt Mistral API" in dashboard
+
+### API Endpoints
+Alle endpoints werken nu correct:
+- `/api/sessions` — Sessies lijst
+- `/api/stats` — Statistieken overzicht  
+- `/api/gpu` — GPU status (cloud-only of lokaal)
+- `/api/token-usage` — Mistral API token gebruik & kosten
+- `/api/models` — Per-model statistieken
+- `/api/token-usage/daily` — Dagelijkse token usage
+- `/api/token-usage/sessions` — Token usage per sessie
+
 ## Functionaliteit
 
 ### 🎯 Overzichtsscherm

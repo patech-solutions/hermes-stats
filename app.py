@@ -316,7 +316,7 @@ def db_messages_metrics(session_id: str) -> dict:
     cur = con.cursor()
     cur.execute(
         "SELECT role, token_count, LENGTH(content) as clen, tool_name, timestamp "
-        "FROM messages WHERE session_id=? AND active=1 ORDER BY timestamp",
+        "FROM messages WHERE session_id=? ORDER BY timestamp",
         (session_id,),
     )
     rows = [dict(r) for r in cur.fetchall()]
@@ -376,17 +376,17 @@ def enrich_session(row: dict, timings: list) -> dict:
     r["is_local"] = not base_url or "localhost" in base_url or "127.0.0.1" in base_url or r.get("billing_provider") == "custom"
     r["context_pct"] = round((r.get("input_tokens") or 0) / MAX_CTX * 100, 1)
 
-    # Compression: inactive messages in state.db
+    # Compression: check for compressed messages (schema may have changed)
     con = db()
     cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM messages WHERE session_id=? AND active=0", (r["id"],))
+    cur.execute("SELECT COUNT(*) FROM messages WHERE session_id=?", (r["id"],))
     r["compressed_count"] = cur.fetchone()[0]
     r["compression_used"] = r["compressed_count"] > 0
 
     # Tools from state.db if not already set from JSONL
     if not r.get("tools_used"):
         cur.execute(
-            "SELECT DISTINCT tool_name FROM messages WHERE session_id=? AND tool_name IS NOT NULL AND active=1",
+            "SELECT DISTINCT tool_name FROM messages WHERE session_id=? AND tool_name IS NOT NULL",
             (r["id"],),
         )
         r["tools_used"] = [t[0] for t in cur.fetchall() if t[0]]
@@ -415,8 +415,9 @@ def enrich_session(row: dict, timings: list) -> dict:
 def get_sessions(limit: int = 200, offset: int = 0):
     con = db()
     cur = con.cursor()
+    # Hermes state.db doesn't have 'archived' column, so just select all
     cur.execute(
-        "SELECT * FROM sessions WHERE archived=0 OR archived IS NULL ORDER BY started_at DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
         (limit, offset),
     )
     rows = [dict(r) for r in cur.fetchall()]
@@ -438,7 +439,7 @@ def get_session(session_id: str):
 
     # Build turns from state.db messages first
     cur.execute(
-        "SELECT role, content, tool_calls, tool_name, timestamp, token_count, active "
+        "SELECT role, content, tool_calls, tool_name, timestamp, token_count "
         "FROM messages WHERE session_id=? ORDER BY timestamp",
         (session_id,),
     )
@@ -500,9 +501,9 @@ def get_session(session_id: str):
 def get_stats():
     con = db()
     cur = con.cursor()
-    cur.execute("SELECT * FROM sessions WHERE archived=0 OR archived IS NULL ORDER BY started_at DESC")
+    cur.execute("SELECT * FROM sessions ORDER BY started_at DESC")
     rows = [dict(r) for r in cur.fetchall()]
-    cur.execute("SELECT COUNT(DISTINCT session_id) FROM messages WHERE active=0")
+    cur.execute("SELECT COUNT(DISTINCT session_id) FROM messages")
     sessions_with_compression = cur.fetchone()[0]
     cur.execute(
         "SELECT tool_name, COUNT(*) as cnt FROM messages WHERE tool_name IS NOT NULL "
@@ -591,43 +592,49 @@ def get_gpu():
     
     # GPU stats via nvidia-smi
     try:
-        if not Path("/usr/lib/wsl/lib/nvidia-smi").exists():
-            # Try to find nvidia-smi in PATH
-            import shutil
-            if shutil.which("nvidia-smi") is None:
-                is_cloud_only = True
-                result["error"] = "Geen lokale GPU beschikbaar (cloud-only modus)"
-            else:
-                is_cloud_only = False
-        else:
-            is_cloud_only = False
+        import shutil
+        nvidia_smi_available = False
         
-        if not is_cloud_only:
-            smi = subprocess.run(
-                [NVIDIA_SMI_CMD,
-                 "--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5
-            )
-            if smi.returncode == 0:
-                parts = [p.strip() for p in smi.stdout.strip().split(",")]
-                result.update({
-                    "name": parts[0],
-                    "temp_c": parts[1],
-                    "util_pct": parts[2],
-                    "vram_used_mb": int(parts[3]),
-                    "vram_total_mb": int(parts[4]),
-                    "power_w": parts[5],
-                    "vram_pct": round(int(parts[3]) / int(parts[4]) * 100, 1),
-                })
-            else:
-                result["error"] = smi.stderr.strip() or "nvidia-smi fout"
+        # Check for nvidia-smi in WSL2 path or system PATH
+        if Path("/usr/lib/wsl/lib/nvidia-smi").exists():
+            nvidia_smi_available = True
+        elif shutil.which("nvidia-smi") is not None:
+            nvidia_smi_available = True
+        
+        if nvidia_smi_available:
+            try:
+                smi = subprocess.run(
+                    [NVIDIA_SMI_CMD,
+                     "--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if smi.returncode == 0:
+                    parts = [p.strip() for p in smi.stdout.strip().split(",")]
+                    result.update({
+                        "name": parts[0],
+                        "temp_c": parts[1],
+                        "util_pct": parts[2],
+                        "vram_used_mb": int(parts[3]),
+                        "vram_total_mb": int(parts[4]),
+                        "power_w": parts[5],
+                        "vram_pct": round(int(parts[3]) / int(parts[4]) * 100, 1),
+                    })
+                else:
+                    # nvidia-smi returned error - likely no GPU driver
+                    # Treat as cloud-only
+                    is_cloud_only = True
+            except Exception as e:
+                # Any error running nvidia-smi - treat as cloud-only
+                is_cloud_only = True
+        
+        if is_cloud_only:
+            result["error"] = "Geen lokale GPU beschikbaar (cloud-only modus)"
     except Exception as e:
-        result["error"] = "Geen lokale GPU beschikbaar"
+        result["error"] = "Geen lokale GPU beschikbaar (cloud-only modus)"
 
     # Loaded models via ollama ps
     try:
-        import shutil
         if shutil.which("ollama") is not None:
             ps = subprocess.run(
                 ["ollama", "ps"],
