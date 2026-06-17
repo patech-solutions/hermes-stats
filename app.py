@@ -13,11 +13,13 @@ app = FastAPI(title="Hermes Dashboard")
 DB_PATH = Path.home() / ".hermes/state.db"
 SESSIONS_DIR = Path.home() / ".hermes/sessions"
 AGENT_LOG = Path.home() / ".hermes/logs/agent.log"
-MAX_CTX = 64000  # Hermes default context window
+MAX_CTX = 131072  # mistral-medium-3 context window
+COMPRESSION_THRESHOLD = 52428  # active compression trigger (~40% of 128K)
 CHARS_PER_TOKEN = 4
 
 # API Pricing (as of June 2026, in EUR per 1K tokens)
 MISTRAL_PRICING = {
+    'mistral-medium-3': {'input': 0.0004, 'output': 0.002, 'cache': 0.0002},
     'mistral-large-2512': {'input': 0.002, 'output': 0.006, 'cache': 0.001},
     'codestral-latest': {'input': 0.0005, 'output': 0.0015, 'cache': 0.00025},
     'mistral-small-2603': {'input': 0.00025, 'output': 0.00075, 'cache': 0.000125},
@@ -377,7 +379,9 @@ def enrich_session(row: dict, timings: list) -> dict:
     # API usage (Mistral, Honcho, OpenRouter, etc.) is Cloud, not local
     # Only mark as local if there's no API endpoint or it's a true local endpoint
     r["is_local"] = not base_url or "localhost" in base_url or "127.0.0.1" in base_url
-    r["context_pct"] = round((r.get("input_tokens") or 0) / MAX_CTX * 100, 1)
+    tokens = r.get("input_tokens") or 0
+    r["context_pct"] = round(tokens / MAX_CTX * 100, 1)
+    r["compression_pct"] = round(tokens / COMPRESSION_THRESHOLD * 100, 1)
 
     # Compression: check for compressed messages (schema may have changed)
     con = db()
@@ -571,6 +575,7 @@ def get_stats():
         "top_tools": top_tools,
         "sessions_per_day": sessions_per_day,
         "max_ctx": MAX_CTX,
+        "compression_threshold": COMPRESSION_THRESHOLD,
         "avg_response_s": None,
         "max_response_s": None,
         "total_responses_logged": 0,
@@ -1058,7 +1063,8 @@ async function loadTokenUsage() {
 function renderStats(stats) {
   const cloud_count = stats.total - stats.local_count;
   document.getElementById('header-sub').textContent =
-    stats.total + ' sessies · ' + stats.total + ' Cloud API · Max ctx: ' + (stats.max_ctx||40960).toLocaleString('nl-NL') + ' tokens';
+    stats.total + ' sessies · Cloud API · Max ctx: ' + (stats.max_ctx||131072).toLocaleString('nl-NL') +
+    ' · Compressie bij: ' + (stats.compression_threshold||52428).toLocaleString('nl-NL') + ' tokens';
 
   const cards = [
     { label: 'Totaal sessies',      value: stats.total,                         sub: stats.completed + ' afgerond',                     cls: '' },
