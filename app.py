@@ -1,8 +1,11 @@
+import ipaddress
 import json
+import urllib.request
 import re
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 from collections import defaultdict
 
 from fastapi import FastAPI, HTTPException
@@ -16,6 +19,7 @@ AGENT_LOG = Path.home() / ".hermes/logs/agent.log"
 MAX_CTX = 131072  # mistral-medium-3 context window
 COMPRESSION_THRESHOLD = 52428  # active compression trigger (~40% of 128K)
 CHARS_PER_TOKEN = 4
+OLLAMA_URL = "http://localhost:11434"
 MAX_MSG_CHARS = 20000  # max tekens per bericht in de gespreksweergave
 
 # API Pricing (as of June 2026, in EUR per 1K tokens)
@@ -34,6 +38,20 @@ NVIDIA_SMI_CMD = str(NVIDIA_SMI) if NVIDIA_SMI.exists() else "nvidia-smi"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def is_local_endpoint(base_url: str) -> bool:
+    """True voor lokale/LAN-endpoints (Ollama e.d.), False voor publieke cloud-API's."""
+    if not base_url:
+        return True
+    host = (urlparse(base_url).hostname or "").lower()
+    if host in ("localhost", "host.docker.internal") or host.endswith(".local") or host.endswith(".lan"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback or ip.is_private or ip.is_link_local
+    except ValueError:
+        return False
+
 
 def db():
     import sqlite3
@@ -219,9 +237,10 @@ def calculate_call_cost(model: str, in_tokens: int, out_tokens: int, cache_token
     """Calculate cost for a single API call based on model pricing."""
     pricing = MISTRAL_PRICING.get(model)
     if not pricing:
-        # Default to codestral-latest pricing if model not found
-        pricing = MISTRAL_PRICING.get('codestral-latest', {'input': 0.0005, 'output': 0.0015, 'cache': 0.00025})
-    
+        # Geen bekende cloudprijs: lokaal model (Ollama e.d.) of onbekend → geen kosten.
+        # (Voorheen viel dit terug op codestral-tarief, waardoor lokale modellen kosten kregen.)
+        return 0.0
+
     cost = 0.0
     cost += (in_tokens / 1000) * pricing.get('input', 0)
     cost += (out_tokens / 1000) * pricing.get('output', 0)
@@ -375,11 +394,10 @@ def enrich_session(row: dict, timings: list) -> dict:
 
     r["duration_s"] = round(ended - started, 1) if (ended and started and ended > started) else None
     r["started_str"] = datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M") if started else None
-    base_url = r.get("billing_base_url") or ""
-    billing_provider = r.get("billing_provider") or ""
-    # API usage (Mistral, Honcho, OpenRouter, etc.) is Cloud, not local
-    # Only mark as local if there's no API endpoint or it's a true local endpoint
-    r["is_local"] = not base_url or "localhost" in base_url or "127.0.0.1" in base_url
+    # Lokaal = geen endpoint geregistreerd (oudere sessies, altijd Ollama) of een
+    # endpoint op deze machine / het eigen netwerk. Cloud-API's (Mistral, OpenRouter,
+    # Anthropic, ...) hebben een publieke host en tellen als cloud.
+    r["is_local"] = is_local_endpoint(r.get("billing_base_url") or "")
     tokens = r.get("input_tokens") or 0
     r["context_pct"] = round(tokens / MAX_CTX * 100, 1)
     r["compression_pct"] = round(tokens / COMPRESSION_THRESHOLD * 100, 1)
@@ -630,6 +648,7 @@ def get_gpu():
                     capture_output=True, text=True, timeout=5
                 )
                 if smi.returncode == 0:
+                    is_cloud_only = False
                     parts = [p.strip() for p in smi.stdout.strip().split(",")]
                     result.update({
                         "name": parts[0],
@@ -653,26 +672,26 @@ def get_gpu():
     except Exception as e:
         result["error"] = "Geen lokale GPU beschikbaar (cloud-only modus)"
 
-    # Loaded models via ollama ps
+    # Geladen modellen via de Ollama HTTP-API (de CLI-tabel van `ollama ps` is niet
+    # betrouwbaar op spaties te splitsen: "8.1 GB" en "100% GPU" zijn twee woorden)
     try:
-        if shutil.which("ollama") is not None:
-            ps = subprocess.run(
-                ["ollama", "ps"],
-                capture_output=True, text=True, timeout=5
-            )
-            if ps.returncode == 0:
-                lines = ps.stdout.strip().splitlines()
-                for line in lines[1:]:  # skip header
-                    parts = line.split()
-                    if len(parts) >= 5:
-                        result["models"].append({
-                            "name": parts[0],
-                            "size": parts[2] + " " + parts[3],
-                            "processor": parts[4],
-                            "context": parts[5] if len(parts) > 5 else "—",
-                        })
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/ps", timeout=3) as resp:
+            for m in json.load(resp).get("models", []):
+                size, vram = m.get("size") or 0, m.get("size_vram") or 0
+                if size and vram >= size:
+                    processor = "100% GPU"
+                elif vram:
+                    processor = f"{round((size - vram) / size * 100)}%/{round(vram / size * 100)}% CPU/GPU"
+                else:
+                    processor = "100% CPU"
+                result["models"].append({
+                    "name": m.get("name"),
+                    "size": f"{size / 1e9:.1f} GB",
+                    "processor": processor,
+                    "context": m.get("context_length") or "—",
+                })
     except Exception:
-        # Ollama not available - this is expected in cloud-only mode
+        # Ollama niet bereikbaar (bijv. cloud-only setup)
         pass
 
     return result
@@ -1100,7 +1119,7 @@ async function loadTokenUsage() {
 function renderStats(stats) {
   const cloud_count = stats.total - stats.local_count;
   document.getElementById('header-sub').textContent =
-    stats.total + ' sessies · Cloud API · Max ctx: ' + (stats.max_ctx||131072).toLocaleString('nl-NL') +
+    stats.total + ' sessies · ' + stats.local_count + ' lokaal / ' + (stats.total - stats.local_count) + ' cloud API · Max ctx: ' + (stats.max_ctx||131072).toLocaleString('nl-NL') +
     ' · Compressie bij: ' + (stats.compression_threshold||52428).toLocaleString('nl-NL') + ' tokens';
 
   const cards = [
@@ -1112,7 +1131,7 @@ function renderStats(stats) {
     { label: 'Gem. reactietijd',    value: stats.avg_response_s ? stats.avg_response_s + 's' : '—', sub: 'max ' + (stats.max_response_s ? stats.max_response_s + 's' : '—'), cls: 'warn' },
     { label: 'Totaal tool calls',   value: fmtNum(stats.total_tool_calls),      sub: 'gem. ' + fmtNum(stats.avg_tools) + '/sessie',      cls: 'accent' },
     { label: 'Compressie',          value: stats.sessions_with_compression,     sub: 'sessies met compressie',                           cls: 'accent' },
-    { label: 'API Type',            value: stats.total + ' Cloud API', sub: 'Backend verdeling',                                   cls: 'green' },
+    { label: 'API Type',            value: stats.local_count + ' lokaal / ' + (stats.total - stats.local_count) + ' cloud', sub: 'Backend verdeling',                                   cls: 'green' },
   ];
 
   document.getElementById('stats-grid').innerHTML = cards.map(c => `
@@ -1264,7 +1283,7 @@ function renderSessions(sessions) {
     </div>`;
     const tools = (s.tools_used||[]).slice(0,3).map(t=>`<span class="pill pill-tool">${t.replace(/_tool$/,'')}</span>`).join('') +
       ((s.tools_used||[]).length > 3 ? `<span class="pill pill-tool">+${s.tools_used.length-3}</span>` : '');
-    const backend = '<span class="pill pill-cloud">Cloud API</span>';
+    const backend = s.is_local ? '<span class="pill pill-local">lokaal</span>' : '<span class="pill pill-cloud">Cloud API</span>';
     const comp = s.compression_used ? '<span class="pill pill-compressed">ja</span>' : '<span style="color:var(--muted)">—</span>';
     const turns = s.api_call_count || 0;
     const turnsEst = s.token_source === 'estimated' ? '<span class="pill-est">~</span>' : '';
@@ -1296,7 +1315,7 @@ async function showDetail(id) {
     const s = await fetchJSON(`/api/sessions/${id}`);
     const turns = s.turns || [];
     const cp = s.context_pct || 0;
-    const backend = '<span class="pill pill-cloud">Cloud API</span>';
+    const backend = s.is_local ? '<span class="pill pill-local">lokaal</span>' : '<span class="pill pill-cloud">Cloud API</span>';
     const comp = s.compression_used ? `<span class="pill pill-compressed">${s.compressed_count} berichten gecomprimeerd</span>` : '—';
     const estNote = s.token_source === 'estimated' ? ' <span class="pill-est">geschat</span>' : '';
 
