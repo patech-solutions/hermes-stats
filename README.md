@@ -43,6 +43,7 @@ Alle endpoints werken nu correct:
 
 ### 📊 Sessiedetail
 - Turn-by-turn uitsplitsing: duur, tokens, gebruikte tools
+- **Gespreksweergave in twee richtingen:** per turn het volledige gebruikersbericht én de antwoorden van de assistent (incl. tussentijdse berichten en Hermes-systeemnudges), met tijdstempel. Lange berichten zijn in-/uitklapbaar (klik op het bericht of "Alles uitklappen"). Tekst wordt HTML-escaped weergegeven.
 - Context window visualisatie (gebruik vs. maximum)
 - Compressiestatus
 

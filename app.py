@@ -16,6 +16,7 @@ AGENT_LOG = Path.home() / ".hermes/logs/agent.log"
 MAX_CTX = 131072  # mistral-medium-3 context window
 COMPRESSION_THRESHOLD = 52428  # active compression trigger (~40% of 128K)
 CHARS_PER_TOKEN = 4
+MAX_MSG_CHARS = 20000  # max tekens per bericht in de gespreksweergave
 
 # API Pricing (as of June 2026, in EUR per 1K tokens)
 MISTRAL_PRICING = {
@@ -462,13 +463,21 @@ def get_session(session_id: str):
         role = msg.get("role", "")
         if role == "session_meta":
             continue
+        content = str(msg.get("content") or "")
+        # Hermes-interne nudges ("[System: Continue now ...]") komen als user-bericht
+        # binnen maar horen bij de lopende turn, niet als nieuwe vraag van de gebruiker.
+        if role == "user" and current_turn and content.startswith("[System:"):
+            current_turn["messages"].append({"role": "system", "text": content[:MAX_MSG_CHARS], "ts": msg.get("timestamp")})
+            continue
         if role == "user":
             if current_turn:
                 turns.append(current_turn)
             current_turn = {
                 "turn": len(turns) + 1,
                 "user_ts": msg.get("timestamp"),
-                "user_msg": (str(msg.get("content") or ""))[:200],
+                "user_msg": content[:200],
+                "messages": [{"role": "user", "text": content[:MAX_MSG_CHARS], "ts": msg.get("timestamp")}],
+                "assistant_msg": "",
                 "assistant_ts": None,
                 "tools": [],
                 "token_count": msg.get("token_count") or 0,
@@ -476,6 +485,9 @@ def get_session(session_id: str):
             }
         elif role == "assistant" and current_turn:
             current_turn["assistant_ts"] = msg.get("timestamp")
+            if content.strip():
+                current_turn["messages"].append({"role": "assistant", "text": content[:MAX_MSG_CHARS], "ts": msg.get("timestamp")})
+                current_turn["assistant_msg"] = content[:MAX_MSG_CHARS]
             tool_calls = msg.get("tool_calls")
             if tool_calls:
                 try:
@@ -880,6 +892,23 @@ HTML = r"""<!DOCTYPE html>
   .detail-meta span { color: var(--muted); font-size: 12px; }
   .detail-meta strong { color: var(--text); }
 
+  /* Gespreksweergave (sessiedetail) */
+  .conv { padding: 12px 16px; display: flex; flex-direction: column; gap: 14px; }
+  .conv-turn { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--bg); }
+  .conv-head { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .conv-num { color: var(--text); font-weight: 600; }
+  .msg { max-width: 85%; margin: 6px 0; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--border); }
+  .msg-user { margin-right: auto; background: var(--card2); }
+  .msg-assistant { margin-left: auto; background: rgba(124,106,247,.10); border-color: rgba(124,106,247,.3); }
+  .msg-system { margin: 6px auto; max-width: 70%; background: rgba(245,166,35,.08); border-color: rgba(245,166,35,.25); font-size: 12px; }
+  .msg-empty .msg-body { color: var(--muted); font-style: italic; }
+  .msg-role { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .msg-body { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.45; }
+  .msg-body.long { cursor: pointer; }
+  .msg-body.collapsed { max-height: 9em; overflow: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, #000 70%, transparent); mask-image: linear-gradient(to bottom, #000 70%, transparent); }
+  @media (max-width: 768px) { .msg, .msg-system { max-width: 100%; } }
+
   .loading { color: var(--muted); text-align: center; padding: 40px; }
   .error-msg { color: var(--danger); text-align: center; padding: 20px; }
 
@@ -958,6 +987,14 @@ const fmtDur = s => {
   return Math.floor(s/60) + 'm ' + Math.round(s%60) + 's';
 };
 const ctxColor = p => p > 80 ? 'fill-danger' : p > 50 ? 'fill-warn' : 'fill-accent';
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const isLong = t => (t||'').length > 600 || (t||'').split('\n').length > 8;
+const fmtTime = ts => new Date(ts * 1000).toLocaleTimeString('nl-NL', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+function toggleAllMsgs(btn) {
+  const expand = btn.textContent.startsWith('Alles uit');
+  document.querySelectorAll('.conv .msg-body.long').forEach(el => el.classList.toggle('collapsed', !expand));
+  btn.textContent = expand ? 'Alles inklappen' : 'Alles uitklappen';
+}
 
 async function fetchJSON(url) {
   const r = await fetch(url);
@@ -1263,24 +1300,31 @@ async function showDetail(id) {
     const comp = s.compression_used ? `<span class="pill pill-compressed">${s.compressed_count} berichten gecomprimeerd</span>` : '—';
     const estNote = s.token_source === 'estimated' ? ' <span class="pill-est">geschat</span>' : '';
 
+    const roleLabel = {user: 'Gebruiker', assistant: 'Assistent', system: 'Hermes (systeem)'};
     const turnsHtml = turns.length ? `
       <div class="table-wrap" style="margin-top:14px">
-        <div style="padding:12px 16px;border-bottom:1px solid var(--border)">
-          <h3 style="font-size:13px;color:var(--muted)">Turns (${turns.length})</h3>
+        <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+          <h3 style="font-size:13px;color:var(--muted)">Gesprek — ${turns.length} turns</h3>
+          <button class="nav-btn" onclick="toggleAllMsgs(this)">Alles uitklappen</button>
         </div>
-        <div class="table-scroll">
-          <table>
-            <thead><tr><th>#</th><th>Gebruikersbericht</th><th>Duur</th><th>Tokens</th><th>Tools</th></tr></thead>
-            <tbody>${turns.map(t => `
-              <tr>
-                <td style="color:var(--muted)">${t.turn}</td>
-                <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:12px" title="${t.user_msg}">${t.user_msg||'—'}</td>
-                <td style="white-space:nowrap;color:var(--warn)">${fmtDur(t.duration_s)}</td>
-                <td style="text-align:right">${fmtNum(t.token_count)||'—'}</td>
-                <td>${(t.tools||[]).map(tool=>`<span class="pill pill-tool">${tool.replace(/_tool$/,'')}</span>`).join('')||'<span style="color:var(--muted);font-size:12px">—</span>'}</td>
-              </tr>`).join('')}
-            </tbody>
-          </table>
+        <div class="conv">${turns.map(t => `
+          <div class="conv-turn">
+            <div class="conv-head">
+              <span class="conv-num">#${t.turn}</span>
+              <span style="color:var(--warn)">${fmtDur(t.duration_s)}</span>
+              <span>${fmtNum(t.token_count)||'—'} tokens</span>
+              <span>${(t.tools||[]).map(tool=>`<span class="pill pill-tool">${esc(tool.replace(/_tool$/,''))}</span>`).join('')}</span>
+            </div>
+            ${(t.messages||[{role:'user', text:t.user_msg}]).map(m => `
+              <div class="msg msg-${m.role}">
+                <div class="msg-role">${roleLabel[m.role]||esc(m.role)}${m.ts?' · '+fmtTime(m.ts):''}</div>
+                ${isLong(m.text)
+                  ? `<div class="msg-body collapsed long" title="Klik om uit/in te klappen" onclick="this.classList.toggle('collapsed')">${esc(m.text)}</div>`
+                  : `<div class="msg-body">${esc(m.text)||'—'}</div>`}
+              </div>`).join('')}
+            ${(t.messages||[]).some(m => m.role==='assistant') ? '' : `
+              <div class="msg msg-assistant msg-empty"><div class="msg-role">Assistent</div><div class="msg-body">Geen tekstantwoord (alleen tool-calls of afgebroken)</div></div>`}
+          </div>`).join('')}
         </div>
       </div>` : '';
 
